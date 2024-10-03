@@ -75,8 +75,8 @@ resource productsdb 'Microsoft.Sql/servers/databases@2023-05-01-preview' = {
   location: location
   sku: {
     capacity: 5
-    tier: 'Basic'
-    name: 'Basic'
+    tier: zoneRedundant ? 'Standard' : 'Basic'
+    name: zoneRedundant ? 'S1' : 'Basic'
   }
   properties: {
     zoneRedundant: zoneRedundant
@@ -89,8 +89,8 @@ resource profilesdb 'Microsoft.Sql/servers/databases@2023-05-01-preview' = {
   location: location
   sku: {
     capacity: 5
-    tier: 'Basic'
-    name: 'Basic'
+    tier: zoneRedundant ? 'Standard' : 'Basic'
+    name: zoneRedundant ? 'S1' : 'Basic'
   }
   properties: {
     zoneRedundant: zoneRedundant
