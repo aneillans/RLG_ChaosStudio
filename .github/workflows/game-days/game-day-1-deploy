@@ -1,0 +1,20 @@
+name: Game Day 1 Deploy
+
+on:
+    workflow_dispatch:
+
+jobs:
+    call-build-deploy:
+        uses: ./.github/workflows/build-deploy.yml
+        with:
+            teams: ${{ env.GAME_DAY_TEAMS }}
+
+        jobs:
+            call-build-deploy:
+                strategy:
+                    matrix:
+                        team: ${{ env.GAME_DAY_TEAMS }}
+                uses: ./.github/workflows/build-deploy.yml
+                with:
+                    team: ${{ matrix.team }}
+                env: ${{ vars.DEPLOYMENT_NAME }}${{ matrix.team }}
