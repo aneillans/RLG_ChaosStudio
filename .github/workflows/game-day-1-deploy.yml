@@ -14,7 +14,7 @@ jobs:
   create-deployment-array:
     runs-on: ubuntu-latest
     outputs:
-      deployment_array: ${{ steps.set-array.outputs.array }}
+      deployment_array: ${{ steps.set-array.outputs.deployment_array }}
     steps:
       - name: Create deployment array
         id: set-array
@@ -23,8 +23,8 @@ jobs:
           array=$(seq -f '%g,' 1 $count)
           array=${array::-1}
           array=[$array]
-          echo "array=${array[@]}" | tee -a $GITHUB_ENV
-          echo "::set-output name=array::${array[@]}"
+          echo $array | tee -a $GITHUB_ENV
+          echo echo "deployment_array=$array" >> $GITHUB_OUTPUT
   call-build-deploy:
     strategy:
       matrix:
