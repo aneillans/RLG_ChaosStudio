@@ -20,13 +20,15 @@ jobs:
         id: set-array
         run: |
           count=${{ env.DEPLOYMENT_COUNT }}
-          array=($(seq 1 $count))
+          array=$(seq -f '%g,' 1 $count)
+          array=${array::-1}
+          array=[$array]
           echo "array=${array[@]}" | tee -a $GITHUB_ENV
           echo "::set-output name=array::${array[@]}"
   call-build-deploy:
     strategy:
       matrix:
         team: ${{ needs.create-deployment-array.outputs.deployment_array }}
-    uses: ./.github/workflows/game-days/build-deploy.yml
+    uses: ./.github/workflows/test-action.yml
     with:
       DEPLOYMENT_NAME: ${{ vars.DEPLOYMENT_NAME }}${{ matrix.team }}
