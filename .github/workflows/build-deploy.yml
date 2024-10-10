@@ -18,7 +18,7 @@ env:
 
   # Do we want to deploy the Chaos Experiments?
   # This is included as a setting, because the Chaos Workshop may prefer to deploy the experiments afterwards.
-  DEPLOYMENT_CHAOS: ${{ inputs.DEPLOYMENT_CHAOS != null && inputs.DEPLOYMENT_CHAOS || vars.DEPLOYMENT_NAME }}
+  DEPLOYMENT_CHAOS: ${{ inputs.DEPLOYMENT_CHAOS != null && inputs.DEPLOYMENT_CHAOS || vars.DEPLOYMENT_CHAOS }}
 
   # Client ID of the application we'll use to handle logins on the website
   # If this value remains empty, authentication will not be used. 
