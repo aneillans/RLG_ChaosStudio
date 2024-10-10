@@ -466,7 +466,7 @@ jobs:
         run: |
           helm repo add chaos-mesh https://charts.chaos-mesh.org
           helm repo update
-          helm install chaos-mesh chaos-mesh/chaos-mesh \
+          helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh \
             --create-namespace \
             --namespace=chaos-testing \
             --set chaosDaemon.runtime=containerd \
