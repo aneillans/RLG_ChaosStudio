@@ -7,7 +7,7 @@ name: Build and Deploy Application
 env:
   # This is the global resource prefix for this deployment
   # Use lower case letters and numbers only and no more than 6 chars
-  DEPLOYMENT_NAME: ${{ vars.DEPLOYMENT_NAME }}
+  DEPLOYMENT_NAME: ${{ inputs.DEPLOYMENT_NAME != null && inputs.DEPLOYMENT_NAME || vars.DEPLOYMENT_NAME }}
 
   # Azure region to which the resources will be deployed
   DEPLOYMENT_REGION: ${{ vars.DEPLOYMENT_REGION }}
@@ -18,7 +18,7 @@ env:
 
   # Do we want to deploy the Chaos Experiments?
   # This is included as a setting, because the Chaos Workshop may prefer to deploy the experiments afterwards.
-  DEPLOYMENT_CHAOS: ${{ vars.DEPLOYMENT_CHAOS }}
+  DEPLOYMENT_CHAOS: ${{ inputs.DEPLOYMENT_CHAOS != null && inputs.DEPLOYMENT_CHAOS || vars.DEPLOYMENT_NAME }}
 
   # Client ID of the application we'll use to handle logins on the website
   # If this value remains empty, authentication will not be used. 
@@ -40,6 +40,19 @@ on:
 
   # We also want to be able to run this manually from Github
   workflow_dispatch:
+
+  # We want to be able to call this workflow from other workflows when deploying multiple environments  
+  workflow_call:
+    inputs:
+      DEPLOYMENT_NAME:
+        required: true
+        type: string
+        description: 'The deployment name'
+      DEPLOYMENT_CHAOS:
+        required: true
+        type: string
+        description: 'Should Chaos experiments be deployed'
+        default: 'false'
 
 jobs:
   deploy-infra:
@@ -116,7 +129,7 @@ jobs:
           # Save the outputs from the deployment
           # These contain the resource names we need for deploying
           $outputsJson = $res.Outputs | ConvertTo-Json -Depth 10
-          $outputsJson | Out-File output.deployment.json
+          $outputsJson | Out-File output.deployment${{env.DEPLOYMENT_NAME}}.json
 
           # Write the Front Door endpoint hostname to the step summary:
           $endpointHostname = $res.Outputs.frontdoor_Endpoint.Value
@@ -139,7 +152,7 @@ jobs:
           }
 
           # Find out the name of the Keyvault:
-          $deploymentOutput = Get-Content output.deployment.json | ConvertFrom-Json -Depth 10
+          $deploymentOutput = Get-Content output.deployment${{env.DEPLOYMENT_NAME}}.json | ConvertFrom-Json -Depth 10
           $keyvaultName = $deploymentOutput.keyvault_Name.Value
 
           # Give myself access to it:
@@ -154,8 +167,8 @@ jobs:
     - name: Save deployment output
       uses: actions/upload-artifact@v4
       with:
-        name: deploymentOutput
-        path: output.deployment.json
+        name: deploymentOutput${{env.DEPLOYMENT_NAME}}
+        path: output.deployment${{env.DEPLOYMENT_NAME}}.json
 
 
   build-products-api:
@@ -175,7 +188,7 @@ jobs:
       # We saved a file with the output from the Azure deployment in the previous job.
     - uses: actions/download-artifact@v4
       with:
-        name: deploymentOutput
+        name: deploymentOutput${{env.DEPLOYMENT_NAME}}
 
       # What we do here is read the files with the output from the previous steps. 
       # Each of the values in there, we store as github env variables for future use.
@@ -186,7 +199,7 @@ jobs:
       with: 
         azPSVersion: "latest"
         inlineScript: | 
-          $deploymentOutput = Get-Content "output.deployment.json" | ConvertFrom-Json -Depth 10  
+          $deploymentOutput = Get-Content "output.deployment${{env.DEPLOYMENT_NAME}}.json" | ConvertFrom-Json -Depth 10  
           $deploymentOutput.psobject.properties | ForEach-Object {
             ("{0}={1}" -f ($_.Name).ToUpper(), $_.Value.Value) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
@@ -234,14 +247,14 @@ jobs:
   
       - uses: actions/download-artifact@v4
         with:
-          name: deploymentOutput
+          name: deploymentOutput${{env.DEPLOYMENT_NAME}}
       
       - name: Parse Deployment Output
         uses: azure/powershell@v2
         with: 
           azPSVersion: "latest"
           inlineScript: | 
-            $deploymentOutput = Get-Content "output.deployment.json" | ConvertFrom-Json -Depth 10  
+            $deploymentOutput = Get-Content "output.deployment${{env.DEPLOYMENT_NAME}}.json" | ConvertFrom-Json -Depth 10  
             $deploymentOutput.psobject.properties | ForEach-Object {
               ("{0}={1}" -f ($_.Name).ToUpper(), $_.Value.Value) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             }
@@ -286,14 +299,14 @@ jobs:
       - name: Download Deployment Output
         uses: actions/download-artifact@v4
         with:
-          name: deploymentOutput
+          name: deploymentOutput${{env.DEPLOYMENT_NAME}}
   
       - name: Parse Deployment Output
         uses: azure/powershell@v2
         with: 
           azPSVersion: "latest"
           inlineScript: | 
-            $deploymentOutput = Get-Content "output.deployment.json" | ConvertFrom-Json -Depth 10  
+            $deploymentOutput = Get-Content "output.deployment${{env.DEPLOYMENT_NAME}}.json" | ConvertFrom-Json -Depth 10  
             $deploymentOutput.psobject.properties | ForEach-Object {
               ("{0}={1}" -f ($_.Name).ToUpper(), $_.Value.Value) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             }
@@ -489,14 +502,14 @@ jobs:
       - name: Download Deployment Output
         uses: actions/download-artifact@v4
         with:
-          name: deploymentOutput
+          name: deploymentOutput${{env.DEPLOYMENT_NAME}}
   
       - name: Parse Deployment Output
         uses: azure/powershell@v2
         with: 
           azPSVersion: "latest"
           inlineScript: | 
-            $deploymentOutput = Get-Content "output.deployment.json" | ConvertFrom-Json -Depth 10  
+            $deploymentOutput = Get-Content "output.deployment${{env.DEPLOYMENT_NAME}}.json" | ConvertFrom-Json -Depth 10  
             $deploymentOutput.psobject.properties | ForEach-Object {
               ("{0}={1}" -f ($_.Name).ToUpper(), $_.Value.Value) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             }
@@ -526,14 +539,14 @@ jobs:
         - name: Download Deployment Output
           uses: actions/download-artifact@v4
           with:
-            name: deploymentOutput
+            name: deploymentOutput${{env.DEPLOYMENT_NAME}}
 
         - name: Parse Deployment Output
           uses: azure/powershell@v2
           with: 
             azPSVersion: "latest"
             inlineScript: | 
-              $deploymentOutput = Get-Content "output.deployment.json" | ConvertFrom-Json -Depth 10  
+              $deploymentOutput = Get-Content "output.deployment${{env.DEPLOYMENT_NAME}}.json" | ConvertFrom-Json -Depth 10  
               $deploymentOutput.psobject.properties | ForEach-Object {
                 ("{0}={1}" -f ($_.Name).ToUpper(), $_.Value.Value) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
               }
@@ -563,7 +576,7 @@ jobs:
         - name: Save build output
           uses: actions/upload-artifact@v4
           with:
-            name: websiteBuild
+            name: websiteBuild${{env.DEPLOYMENT_NAME}}
             path: src/app/ContosoTraders.Ui.Website/build
     
 
@@ -584,12 +597,12 @@ jobs:
       - name: Download Deployment Output
         uses: actions/download-artifact@v4
         with:
-          name: deploymentOutput
+          name: deploymentOutput${{env.DEPLOYMENT_NAME}}
 
       - name: Download Website
         uses: actions/download-artifact@v4
         with:
-          name: websiteBuild
+          name: websiteBuild${{env.DEPLOYMENT_NAME}}
           path: website
 
       - name: Parse Deployment Output
@@ -597,7 +610,7 @@ jobs:
         with: 
           azPSVersion: "latest"
           inlineScript: | 
-            $deploymentOutput = Get-Content "output.deployment.json" | ConvertFrom-Json -Depth 10  
+            $deploymentOutput = Get-Content "output.deployment${{env.DEPLOYMENT_NAME}}.json" | ConvertFrom-Json -Depth 10  
             $deploymentOutput.psobject.properties | ForEach-Object {
               ("{0}={1}" -f ($_.Name).ToUpper(), $_.Value.Value) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             }
@@ -632,14 +645,14 @@ jobs:
     - name: Download Deployment Output
       uses: actions/download-artifact@v4
       with:
-        name: deploymentOutput
+        name: deploymentOutput${{env.DEPLOYMENT_NAME}}
 
     - name: Parse Deployment Output
       uses: azure/powershell@v2
       with: 
         azPSVersion: "latest"
         inlineScript: | 
-          $deploymentOutput = Get-Content "output.deployment.json" | ConvertFrom-Json -Depth 10  
+          $deploymentOutput = Get-Content "output.deployment${{env.DEPLOYMENT_NAME}}.json" | ConvertFrom-Json -Depth 10  
           $deploymentOutput.psobject.properties | ForEach-Object {
             ("{0}={1}" -f ($_.Name).ToUpper(), $_.Value.Value) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
@@ -677,14 +690,14 @@ jobs:
     - name: Download Deployment Output
       uses: actions/download-artifact@v4
       with:
-        name: deploymentOutput
+        name: deploymentOutput${{env.DEPLOYMENT_NAME}}
 
     - name: Parse Deployment Output
       uses: azure/powershell@v2
       with: 
         azPSVersion: "latest"
         inlineScript: | 
-          $deploymentOutput = Get-Content "output.deployment.json" | ConvertFrom-Json -Depth 10  
+          $deploymentOutput = Get-Content "output.deployment${{env.DEPLOYMENT_NAME}}.json" | ConvertFrom-Json -Depth 10  
           $deploymentOutput.psobject.properties | ForEach-Object {
             ("{0}={1}" -f ($_.Name).ToUpper(), $_.Value.Value) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }

@@ -1,15 +1,12 @@
 name: Game Day 1 Deploy
 env: 
-# This is the global resource prefix for this deployment
-  # Use lower case letters and numbers only and no more than 6 chars
-  DEPLOYMENT_NAME: ${{ vars.DEPLOYMENT_NAME }}
-
   # This is the number of environments that we need for the game day
   DEPLOYMENT_COUNT: ${{ vars.DEPLOYMENT_COUNT }}
+  
 
 on:
   workflow_dispatch:
-  
+    
 jobs:
   create-deployment-array:
     runs-on: ubuntu-latest
@@ -20,15 +17,17 @@ jobs:
         id: set-array
         run: |
           count=${{ env.DEPLOYMENT_COUNT }}
-          array=$(seq -f '%g,' 1 $count)
-          array=${array::-1}
-          array=[$array]
-          echo $array | tee -a $GITHUB_ENV
-          echo echo "deployment_array=$array" >> $GITHUB_OUTPUT
+          array=[c,$(seq -s ',' 1 $count)]
+          echo "deployment_array=$array" >> $GITHUB_OUTPUT
+ 
   call-build-deploy:
+    needs: create-deployment-array
     strategy:
       matrix:
-        team: ${{ needs.create-deployment-array.outputs.deployment_array }}
-    uses: ./.github/workflows/test-action.yml
+        team: ${{fromJson(needs.create-deployment-array.outputs.deployment_array)}}
+    uses: ./.github/workflows/build-deploy.yml
     with:
       DEPLOYMENT_NAME: ${{ vars.DEPLOYMENT_NAME }}${{ matrix.team }}
+      DEPLOYMENT_CHAOS: 'false'
+    secrets: inherit
+
