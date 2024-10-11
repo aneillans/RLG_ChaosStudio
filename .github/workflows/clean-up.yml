@@ -39,7 +39,7 @@ jobs:
               done
 
               echo "Purging Key Vault: $kv"
-              az keyvault purge --name $kv
+              az keyvault purge --name $kv --no-wait
             done
             
             # Delete the resource group
