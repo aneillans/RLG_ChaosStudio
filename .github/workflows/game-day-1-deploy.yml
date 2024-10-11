@@ -17,7 +17,7 @@ jobs:
         id: set-array
         run: |
           count=${{ env.DEPLOYMENT_COUNT }}
-          array=[c,$(seq -s ',' 1 $count)]
+          array=[c, $(seq -s ',' 1 $count)]
           echo "deployment_array=$array" >> $GITHUB_OUTPUT
  
   call-build-deploy:
