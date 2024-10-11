@@ -1,0 +1,39 @@
+name: Clean Up
+
+env: 
+  # This is the prefix of environments that will be deleted
+  DEPLOYMENT_NAME: ${{ vars.DEPLOYMENT_NAME }}
+
+on:
+  # WARNING: This workflow will delete all environments!
+  workflow_dispatch:
+
+jobs:
+  clean-up:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Clean up resource groups and purge Key Vaults
+        run: |
+          # Fetch all resource groups with the specified prefix
+          for rg in $(az group list --query "[?starts_with(name, ${{env.DEPLOYMENT_NAME}})].name" -o tsv); do
+            echo "Processing resource group: $rg"
+            
+            # Fetch all Key Vaults in the resource group
+            for kv in $(az keyvault list --resource-group $rg --query "[].name" -o tsv); do
+              echo "Purging Key Vault: $kv"
+              az keyvault purge --name $kv
+            done
+            
+            # Delete the resource group
+            echo "Deleting resource group: $rg"
+            az group delete --name $rg --yes --no-wait
+          done
