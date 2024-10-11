@@ -29,6 +29,15 @@ jobs:
             
             # Fetch all Key Vaults in the resource group
             for kv in $(az keyvault list --resource-group $rg --query "[].name" -o tsv); do
+              echo "Deleting Key Vault: $kv"
+              az keyvault delete --name $kv --resource-group $rg
+
+              # Wait for the Key Vault deletion to complete
+              while az keyvault show --name $kv --resource-group $rg &>/dev/null; do
+                echo "Waiting for Key Vault $kv to be deleted..."
+                sleep 10
+              done
+
               echo "Purging Key Vault: $kv"
               az keyvault purge --name $kv
             done
