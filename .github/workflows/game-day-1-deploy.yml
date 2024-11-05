@@ -1,0 +1,33 @@
+name: Game Day 1 Deploy
+env: 
+  # This is the number of environments that we need for the game day
+  DEPLOYMENT_COUNT: ${{ vars.DEPLOYMENT_COUNT }}
+  
+
+on:
+  workflow_dispatch:
+    
+jobs:
+  create-deployment-array:
+    runs-on: ubuntu-latest
+    outputs:
+      deployment_array: ${{ steps.set-array.outputs.deployment_array }}
+    steps:
+      - name: Create deployment array
+        id: set-array
+        run: |
+          count=${{ env.DEPLOYMENT_COUNT }}
+          array="[\"c\",$(seq -s ',' 1 $count)]"
+          echo "deployment_array=$array" >> $GITHUB_OUTPUT
+ 
+  call-build-deploy:
+    needs: create-deployment-array
+    strategy:
+      matrix:
+        team: ${{fromJson(needs.create-deployment-array.outputs.deployment_array)}}
+    uses: ./.github/workflows/build-deploy.yml
+    with:
+      DEPLOYMENT_NAME: ${{ vars.DEPLOYMENT_NAME }}${{ matrix.team }}
+      DEPLOYMENT_CHAOS: 'false'
+    secrets: inherit
+
