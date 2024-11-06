@@ -26,7 +26,7 @@ This document describes the steps necessary to deploy the demo solution to your 
 
 | Variable | Example value | Description |
 |:-------------|:--------------|:------------|
-| DEPLOYMENT_NAME | cntr01 | Name prefix that will be used for resources. 3-6 chars alfanumeric, lowercase |
+| DEPLOYMENT_NAME | cntr01 | Name prefix that will be used for resources. 3-6 chars alfanumeric, **Must be lowercase **|
 | DEPLOYMENT_REGION | uksouth | Azure region to which resources will be deployed |
 | DEPLOYMENT_ZONES | false | Set to _true_ to enable Availability Zone deployment on all resources. Not recommended for test/demo workloads, unless you specifically want to test the zone-down scenario with an experiment.|
 | DEPLOYMENT_CHAOS | true | Set to _true_ to deploy Chaos Experiments as part of the resource deployment. |
