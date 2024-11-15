@@ -1,0 +1,1102 @@
+# Run on commits to the main branch
+trigger:
+- main
+
+# Expected parameters to the pipeline
+parameters:
+- name: deploymentName
+  displayName: Deployment Name
+  default: "" # Define your default value here
+  type: string
+- name: deploymentChaos
+  displayName: Should Chaos experiments be deployed
+  type: boolean
+  default: false
+- name: useHostedAgents
+  displayName: Use MS Hosted Agents
+  type: boolean
+  default: True
+- name: poolName
+  displayName: ADO Pool Name (if not Hosted Agents)
+  default: " " # Define your default value here
+  type: string
+- name: serviceConnection
+  displayName: Service Connection Name
+  default: "" # Define your default value here
+  type: string
+
+# Any variables that are defined / used in the pipeline
+variables:
+  - name: deploymentName
+    value: ${{ parameters.deploymentName }}
+  - name: deploymentRegion
+    value: "uksouth"
+  - name: deploymentZones
+    value: false
+  - name: deploymentChaos
+    value: ${{ parameters.deploymentChaos }}
+  - name: deploymentSubscription
+    value: "" # If set, will not default to the 'default' subscription
+  - name: productsRepoName
+    value: 'products-api'
+  - name: cartsRepoName
+    value: 'carts-api'
+
+stages:
+  - stage: deploy_infra
+    displayName: Deploy Infra
+    ${{ if eq(parameters.useHostedAgents, true) }}:  
+      pool:
+        vmImage: "ubuntu-latest" # Microsoft Hosted Linux Pool
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}   
+
+    jobs:
+    - job:
+      steps:
+      - checkout: self
+        path: 'checkout_self'
+        clean: True
+        fetchDepth: 0
+        persistCredentials: True
+
+      - task: AzureCLI@2
+        name: azLogin
+        displayName: Login, validate parameters
+        env:
+          deploymentName: ${{variables.deploymentName}}
+          deploymentZones: ${{variables.deploymentZones}}
+          deploymentChaos: ${{variables.deploymentChaos}}
+          deploymentRegion: ${{variables.deploymentRegion}}
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: true
+          inlineScript: |
+              Write-Host "##vso[task.setvariable variable=servicePrincipalId;isoutput=true;isreadonly=true]$env:servicePrincipalId"
+              Write-Host "##vso[task.setvariable variable=servicePrincipalKey;isoutput=true;isreadonly=true]$env:servicePrincipalKey"
+              Write-Host "##vso[task.setvariable variable=tenantId;isoutput=true;isreadonly=true]$env:tenantId"
+
+              Write-Host "Deployment Name:    <$env:deploymentName>"
+              Write-Host "Deployment Zones:   <$env:deploymentZones>"
+              Write-Host "Deployment Chaos:   <$env:deploymentChaos>"
+              Write-Host "Deployment Region:  <$env:deploymentRegion>"
+              
+              if($env:deploymentName -notmatch "^[a-z][a-z0-9]{2,5}$") { 
+                throw "deploymentName must be 3-6 characters long and start with a letter, no whitespace or special characters allowed, and only lowercase letters." 
+                }
+
+              if($env:deploymentRegion -eq '') {
+                throw "deploymentRegion must be set"
+              }
+
+              if($env:deploymentZones -ne 'true' -and $env:deploymentZones -ne 'false') {
+                throw "deploymentZones must be 'true' or 'false'"
+              }
+
+              if($env:deploymentChaos -ne 'true' -and $env:deploymentChaos -ne 'false') {
+                throw "deploymentChaos must be 'true' or 'false'"
+              }
+
+        # Linux VMSS nodes require an SSH key to connect to them. This currently cannot be auto-generated during deployment,
+        # so we handle it here. The public key part is used during deployment and stored in an sshkey resource.
+        # The private key is stored in keyvault after deployment. We check if the keyvault and key already exist before deployment.
+        # If they do, we assume we are updating an existing application and will not regnerate the key.
+      - task: AzurePowerShell@5
+        displayName: Generate SSH Keys for VMSS
+        env:
+          deploymentName: ${{variables.deploymentName}}
+          deploymentZones: ${{variables.deploymentZones}}
+          deploymentChaos: ${{variables.deploymentChaos}}
+          deploymentRegion: ${{variables.deploymentRegion}}
+          deploymentSubscription: ${{variables.deploymentSubscription}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            # Compose the name of the ssh key resource, although we should technically not make forward assumptions about the resource name. 
+
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              Set-AzContext -Subscription "$($env:deploymentSubscription)"
+            }
+
+            $sshkey = "$($env:deploymentName)-vmss-sshkey"
+            $existingKey = Get-AzSshKey -Name $sshkey
+            if($existingKey) {
+                Write-Output "Found existing key, using that instead of creating a new one"
+                Set-Content -Path ./key.pub -Value $existingKey.publicKey
+            } else {
+                Write-Output "Generating new key pair"
+                Invoke-Expression "ssh-keygen -N '' -q -t rsa -b 4096 -f ./key -C contosouser"
+            }
+
+        # Execute the Bicep deployment. This will create all the resources in Azure.
+        # The name of the deployment is set by the DEPLOYMENT_NAME variable and is used to name all resources.
+        # The output of the deployment (values in main.bicep) is stored in a file for retrieval in later jobs.
+      - task: AzurePowerShell@5
+        displayName: Deploy Azure Resources
+        name: azure_deploy
+        env:
+          deploymentName: ${{variables.deploymentName}}
+          deploymentZones: ${{variables.deploymentZones}}
+          deploymentChaos: ${{variables.deploymentChaos}}
+          deploymentRegion: ${{variables.deploymentRegion}}
+          deploymentSubscription: ${{variables.deploymentSubscription}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            # Note that the name and location of the deployment are passed in the New-AzDeployment cmdlet and not in the parameters object.
+            # We also convert the string values from the variable to bool here
+            $parameters = @{
+              zoneRedundant = ($env:deploymentZones -eq 'true')
+              deployChaos = ($env:deploymentChaos -eq 'true')
+            }
+
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              Set-AzContext -Subscription "$($env:deploymentSubscription)"
+            }
+
+            $res = New-AzDeployment -Name $env:deploymentName -TemplateFile "src/infra/bicep/main.bicep" -Location $env:deploymentRegion -TemplateParameterObject $parameters
+            
+            # Save the outputs from the deployment
+            # These contain the resource names we need for deploying
+            $outputsJson = $res.Outputs | ConvertTo-Json -Depth 10
+            $outputsJson | Out-File output.deployment${{variables.deploymentName}}.json
+
+            # Write the Front Door endpoint hostname to the step summary:
+            $endpointHostname = $res.Outputs.frontdoor_Endpoint.Value
+
+            Write-Host "### Azure resource deployment complete :rocket:"
+            Write-Host "#### Your Contoso Traders website can be found at https://$endpointHostname and will start working once the application deployment is complete.
+            Write-Host "#### If you want to enable authentication for your website, ensure that https://$endpointHostname is added as a redirect URI to your Entra application."
+
+      - task: AzureCLI@2
+        displayName: Update NSG Rules for Certs
+        env:
+          deploymentName: ${{variables.deploymentName}}
+          deploymentSubscription: ${{variables.deploymentSubscription}}        
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: true
+          inlineScript: |
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              az account set --subscription "$($env:deploymentSubscription)"
+            }
+            $NSGAKSNAME=$env:deploymentName+"nsg-aks"
+            $RG_NAME=$env:deploymentName+"-rg"
+            az network nsg rule create --resource-group $RG_NAME --nsg-name $NSGAKSNAME --name "AllowAll" --priority 999 --access Allow --direction Inbound --protocol "*" --source-address-prefix "*" --source-port-range "*" --destination-address-prefix "*" --destination-port-range "*"
+
+      # The private key of the SSH key pair should be stored in keyvault. 
+      # If it doesn't exist, we did not regenerate during this deployment and we can move on.
+      - task: AzureCLI@2
+        displayName: Save SSH Private Key to Keyvault
+        env:
+          deploymentName: ${{variables.deploymentName}}
+          deploymentSubscription: ${{variables.deploymentSubscription}}        
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: true
+          inlineScript: |
+            # Check if the key file exists, otherwise we can stop now
+            $keyPath = "./key"
+            if(-not (Test-Path $keyPath)) {
+              Write-Output "Private key file not found, presumably it's already in Keyvault. Skipping."
+              exit
+            }       
+
+            # Find out the name of the Keyvault:
+            $deploymentOutput = Get-Content output.deployment${{variables.deploymentName}}.json | ConvertFrom-Json -Depth 10
+            $keyvaultName = $deploymentOutput.keyvault_Name.Value
+
+            # Give myself access to it:
+            $appId = $env:servicePrincipalId
+            Set-AzKeyVaultAccessPolicy -VaultName $keyvaultName -ServicePrincipalName $appId -PermissionsToSecrets Set
+
+            # Get the key from the file and store it:
+            $key = Get-Content $keyPath -Raw | ConvertTo-SecureString -AsPlainText -Force
+            Set-AzKeyVaultSecret -VaultName $keyvaultName -Name "ssh-private-key" -SecretValue $key
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish the Deployment Outputs
+        inputs:
+          targetPath: output.deployment${{variables.deploymentName}}.json
+          artifactName: deployment-output      
+
+  - stage: build_products_api
+    displayName: Build Products API
+    dependsOn: deploy_infra
+    ${{ if eq(parameters.useHostedAgents, true) }}:  
+      pool:
+        vmImage: "ubuntu-latest" # Microsoft Hosted Linux Pool
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}   
+
+    jobs:
+    - job:
+      steps:
+      - checkout: self
+        path: 'checkout_self'
+        clean: True
+        fetchDepth: 0
+        persistCredentials: True
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the Deployment Outputs
+        inputs:
+          artifact: deployment-output  
+
+      - task: AzurePowerShell@5
+        displayName: Parse Deployment Output
+        name: depout
+        env:
+          deploymentName: ${{variables.deploymentName}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $file = Join-Path $(Agent.BuildDirectory) "output.deployment${{variables.deploymentName}}.json"
+            $deploymentOutput = Get-Content $file | ConvertFrom-Json -Depth 10  
+            $deploymentOutput.psobject.properties | ForEach-Object {
+                Write-Host "##vso[task.setvariable variable=$($_.Name.ToUpper());isoutput=true;isreadonly=true]$($_.Value.Value)"
+                Write-Host "$($_.Name.ToUpper()) = $($_.Value.Value)"
+            }          
+
+        # We build the Docker container for the products API.
+        # The tag is composed of the ACR name, the repo name, and the commit SHA. 
+        # The subsequent push step will look for this tag to identify containers to push
+      - task: AzurePowerShell@5
+        displayName: Build Docker Container
+        env:
+          ACR_REPO_PRODUCTS_NAME: ${{variables.productsRepoName}}
+          ACR_NAME: $(depout.ACR_NAME)
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $repoName = $env:ACR_REPO_PRODUCTS_NAME
+            $version = "$(Build.SourceVersion)"
+            $tag = ("{0}.azurecr.io/{1}:{2}" -f $env:ACR_NAME, $repoName, $version)
+            Write-Output "Building image with tag $tag"
+            $cmd = "docker build -f ./src/app/ContosoTraders.Api.Products/Dockerfile -t $tag src/app"
+            Invoke-Expression $cmd
+
+        # The container registry was deployed with the infrastructure. AKS and ACA will pull from here. 
+      - task: AzurePowerShell@5
+        displayName: Push Container to ACR
+        env:
+          ACR_REPO_PRODUCTS_NAME: ${{variables.productsRepoName}}
+          ACR_NAME: $(depout.ACR_NAME)
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $repoName = $env:ACR_REPO_PRODUCTS_NAME
+            Connect-AzContainerRegistry -Name $env:ACR_NAME
+            $cmd = "docker push --all-tags $($env:ACR_NAME).azurecr.io/$repoName"
+            Invoke-Expression $cmd            
+
+  - stage: build_carts_api
+    displayName: Build Carts API
+    dependsOn: deploy_infra
+    ${{ if eq(parameters.useHostedAgents, true) }}:  
+      pool:
+        vmImage: "ubuntu-latest" # Microsoft Hosted Linux Pool
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}   
+
+    jobs:
+    - job:
+      steps:
+      - checkout: self
+        path: 'checkout_self'
+        clean: True
+        fetchDepth: 0
+        persistCredentials: True
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the Deployment Outputs
+        inputs:
+          artifact: deployment-output  
+
+      - task: AzurePowerShell@5
+        displayName: Parse Deployment Output
+        name: depout
+        env:
+          deploymentName: ${{variables.deploymentName}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $file = Join-Path $(Agent.BuildDirectory) "output.deployment${{variables.deploymentName}}.json"
+            $deploymentOutput = Get-Content $file | ConvertFrom-Json -Depth 10  
+            $deploymentOutput.psobject.properties | ForEach-Object {
+                Write-Host "##vso[task.setvariable variable=$($_.Name.ToUpper());isoutput=true;isreadonly=true]$($_.Value.Value)"
+                Write-Host "$($_.Name.ToUpper()) = $($_.Value.Value)"
+            }          
+
+        # We build the Docker container for the carts API.
+        # The tag is composed of the ACR name, the repo name, and the commit SHA. 
+        # The subsequent push step will look for this tag to identify containers to push
+      - task: AzurePowerShell@5
+        displayName: Build Docker Container
+        env:
+          ACR_REPO_CARTS_NAME: ${{variables.cartsRepoName}}
+          ACR_NAME: $(depout.ACR_NAME)
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $repoName = $env:ACR_REPO_CARTS_NAME
+            $version = "$(Build.SourceVersion)"
+            $tag = ("{0}.azurecr.io/{1}:{2}" -f $env:ACR_NAME, $repoName, $version)
+            Write-Output "Building image with tag $tag"
+            $cmd = "docker build -f ./src/app/ContosoTraders.Api.Carts/Dockerfile -t $tag src/app"
+            Invoke-Expression $cmd
+
+        # The container registry was deployed with the infrastructure. AKS and ACA will pull from here. 
+      - task: AzurePowerShell@5
+        displayName: Push Container to ACR
+        env:
+          ACR_REPO_CARTS_NAME: ${{variables.cartsRepoName}}
+          ACR_NAME: $(depout.ACR_NAME)
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $repoName = $env:ACR_REPO_CARTS_NAME
+            Connect-AzContainerRegistry -Name $env:ACR_NAME
+            $cmd = "docker push --all-tags $($env:ACR_NAME).azurecr.io/$repoName"
+            Invoke-Expression $cmd             
+
+
+  - stage: deploy_products
+    displayName: Deploy Products API to AKS
+    dependsOn: [deploy_infra, build_products_api]
+    ${{ if eq(parameters.useHostedAgents, true) }}:  
+      pool:
+        vmImage: "ubuntu-latest" # Microsoft Hosted Linux Pool
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}   
+
+    jobs:
+    - job:
+      steps:
+      - checkout: self
+        path: 'checkout_self'
+        clean: True
+        fetchDepth: 0
+        persistCredentials: True    
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the Deployment Outputs
+        inputs:
+          artifact: deployment-output  
+
+      - task: AzurePowerShell@5
+        displayName: Parse Deployment Output
+        name: depout
+        env:
+          deploymentName: ${{variables.deploymentName}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $file = Join-Path $(Agent.BuildDirectory) "output.deployment${{variables.deploymentName}}.json"
+            $deploymentOutput = Get-Content $file | ConvertFrom-Json -Depth 10  
+            $deploymentOutput.psobject.properties | ForEach-Object {
+                Write-Host "##vso[task.setvariable variable=$($_.Name.ToUpper());isoutput=true;isreadonly=true]$($_.Value.Value)"
+                Write-Host "$($_.Name.ToUpper()) = $($_.Value.Value)"
+            }          
+
+      - task: HelmInstaller@1
+        displayName: Install Helm
+
+      - task: KubectlInstaller@0
+        displayName: Install Kubectl  
+
+      - task: AzureCLI@2
+        displayName: Set AKS Context
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}    
+          AKSCLUSTER_NAME: $(depout.AKSCLUSTER_NAME)
+          RG_NAME: $(depout.RG_NAME)
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: false
+          inlineScript: |
+            az config set extension.use_dynamic_install=yes_without_prompt
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              az account set --subscription "$($env:deploymentSubscription)"
+            }
+            az aks get-credentials -n $env:AKSCLUSTER_NAME -g $env:RG_NAME --overwrite-existing  
+            
+      - task: PowerShell@2
+        displayName: Update Deployment Manifest
+        env:
+          ACR_REPO_PRODUCTS_NAME: ${{variables.productsRepoName}}      
+          ACR_NAME: $(depout.ACR_NAME)        
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: |
+            (Get-Content ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml).Replace('{AKS_REPLICAS}', '1') | Set-Content ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml
+            (Get-Content ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml).Replace('{PRODUCTS_IMAGE_TAG}', "$(Build.SourceVersion)") | Set-Content ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml
+            (Get-Content ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml).Replace('{ACR_REPO_PRODUCTS_NAME}', "$env:ACR_REPO_PRODUCTS_NAME") | Set-Content ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml
+            (Get-Content ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml).Replace('{ACR_NAME}', "$env:ACR_NAME") | Set-Content ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml            
+
+    # There doesnt appear to be a Azure DevOps alternative for this.
+      # - name: Lint Deployment Manifest
+      #   uses: azure/k8s-lint@v1
+      #   with:
+      #     manifests: ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml
+
+      - task: PowerShell@2
+        displayName: Create Kubernetes Secret (kv endpoint)
+        continueOnError: true
+        env:
+          KEYVAULT_NAME: $(depout.KEYVAULT_NAME)        
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            kubectl create secret generic contoso-traders-kv-endpoint --from-literal=contoso-traders-kv-endpoint="https://$env:KEYVAULT_NAME.vault.azure.net/"
+
+      #   # We're leaving this empty because we want to use the SystemAssigned identity. 
+      #   # TODO look into leaving this out completely and see if it works.
+      - task: PowerShell@2
+        displayName: Create Kubernetes Secret (client id)
+        continueOnError: true
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            kubectl create secret generic contoso-traders-mi-clientid --from-literal=contoso-traders-mi-clientid=""            
+
+      # Note, on the Github version, the images tag was used to swap out the images, but we have moved the replaced of that to the tokenisation instead
+      - task: PowerShell@2
+        displayName: Apply Deployment Manifest
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            kubectl apply -f ./src/app/ContosoTraders.Api.Products/Manifests/Deployment.yaml
+
+      - task: PowerShell@2
+        displayName: Apply Service Manifest
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            kubectl apply -f ./src/app/ContosoTraders.Api.Products/Manifests/Service.yaml
+
+        # Creation of the ingress controller will create an IP address resource in Azure.
+        # This is the IP address used for the ingress traffic to the service. 
+      - task: PowerShell@2
+        displayName: Create Ingress Controller
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+            helm repo update
+            helm upgrade --install nginx-ingress ingress-nginx/ingress-nginx --set controller.replicaCount=1 --set controller.nodeSelector."beta\.kubernetes\.io/os"=linux --set defaultBackend.nodeSelector."beta\.kubernetes\.io/os"=linux --set controller.admissionWebhooks.patch.nodeSelector."beta\.kubernetes\.io/os"=linux --set controller.service.externalTrafficPolicy=Local          
+
+        # By default, Azure IP addresses don't have a DNS name. We need it for our TLS cert to be issued.
+        # We set it by updating the label of the IP address resource in Azure, but the domain part is not user-settable. 
+        # The end result will be something like something.region.cloudapp.azure.com, which we then output as a Github variable.
+      - task: AzureCLI@2
+        displayName: Set Ingress FQDN on IP Address
+        name: productsFqdn
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}
+          DEPLOYMENT_NAME: ${{ parameters.deploymentName }}
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: false
+          inlineScript: |
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              az account set --subscription "$($env:deploymentSubscription)"
+            }      
+
+            # Find out what IP address is associated with the ingress controller:
+            $ingress_ip = (kubectl get services -o jsonpath='{.status.loadBalancer.ingress[0].ip}' -n default nginx-ingress-ingress-nginx-controller)
+
+            # Find out which Azure Public IP Address resource has that IP address
+            $ips = az network public-ip list | ConvertFrom-Json
+            $ip_resource = $ips | Where { $_.IpAddress -eq $ingress_ip } | Select -ExpandProperty Id
+
+            # Update that IP address resource with a new FQDN label:
+            $ip = (az network public-ip update --ids $ip_resource --dns-name $env:DEPLOYMENT_NAME) | ConvertFrom-Json
+
+            # Spit the full FQDN out to the GitHub environment
+            $fqdn = $ip.dnsSettings.fqdn
+            Write-Output "Settings FQDN $fqdn on IP address $ingress_ip"
+            Write-Host "##vso[task.setvariable variable=PRODUCTS_FQDN;isoutput=true;isreadonly=true]$fqdn"
+
+      - task: PowerShell@2
+        displayName: Apply CertManager Namespace Manifest
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            kubectl apply -f ./src/app/ContosoTraders.Api.Products/Manifests/NamespaceCertManager.yaml
+
+        # Install cert-manager in the cluster. This will create a webhook pod in the cert-manager namespace.
+        # We wait for that pod to be running before we continue, otherwise the certificate creation will later fail.
+      - task: AzurePowerShell@5
+        displayName: Install Cert-Manager
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            "kubectl apply --validate=false -f https://github.com/cert-manager/cert-manager/releases/download/v1.15.1/cert-manager.yaml" | Invoke-Expression
+            $webhookpod = (kubectl get pods -n cert-manager -l app=webhook -o jsonpath='{.items[0].metadata.name}')
+            ("kubectl wait -n cert-manager --for=jsonpath='{.status.phase}'=Running pod/$webhookpod") | Invoke-Expression          
+
+        # If we proceed immediately, we'll catch CertManager in an unready state. 
+        # Ideally we would solve this with kubectl wait, but apparently that's not enough in this case. 
+      - task: PowerShell@2
+        displayName: Wait 30 seconds
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            Start-Sleep -Seconds 30
+
+      - task: PowerShell@2
+        displayName: Apply ClusterIssuer Manifest
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            kubectl apply -f ./src/app/ContosoTraders.Api.Products/Manifests/ClusterIssuer.yaml
+
+      - task: PowerShell@2
+        displayName: Update Certificate Manifest
+        env:
+          AKS_FQDN: $(productsFqdn.PRODUCTS_FQDN)        
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: |
+            (Get-Content ./src/app/ContosoTraders.Api.Products/Manifests/Certificate.yaml).Replace('{AKS_FQDN}', "$env:AKS_FQDN") | Set-Content ./src/app/ContosoTraders.Api.Products/Manifests/Certificate.yaml         
+
+      - task: PowerShell@2
+        displayName: Apply Certificate Manifest
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            kubectl apply -f ./src/app/ContosoTraders.Api.Products/Manifests/Certificate.yaml
+     
+      - task: PowerShell@2
+        displayName: Update Ingress Manifest
+        env:
+          AKS_FQDN: $(productsFqdn.PRODUCTS_FQDN)        
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: |
+            (Get-Content ./src/app/ContosoTraders.Api.Products/Manifests/Ingress.yaml).Replace('{AKS_FQDN}', "$env:AKS_FQDN") | Set-Content ./src/app/ContosoTraders.Api.Products/Manifests/Ingress.yaml         
+
+      - task: PowerShell@2
+        displayName: Apply Ingress Manifest
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            kubectl apply -f ./src/app/ContosoTraders.Api.Products/Manifests/Ingress.yaml
+
+      - task: PowerShell@2
+        displayName: Apply ClusterRole Manifest
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: | 
+            kubectl apply -f ./src/app/ContosoTraders.Api.Products/Manifests/ClusterRole.yaml            
+
+      - task: AzureCLI@2
+        displayName: Update Front Door with Products API endpoint
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}    
+          RG_NAME: $(depout.RG_NAME)
+          FRONTDOOR_NAME: $(depout.FRONTDOOR_NAME)
+          PRODUCTS_FQDN: $(productsFqdn.PRODUCTS_FQDN)
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: false
+          inlineScript: |
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              az account set --subscription "$($env:deploymentSubscription)"
+            }          
+            az afd origin update --resource-group $env:RG_NAME --profile-name $env:FRONTDOOR_NAME --origin-group-name origingroup-productsapi --name origin-productsapi --host-name $env:PRODUCTS_FQDN --origin-host-header $env:PRODUCTS_FQDN
+
+      - task: AzurePowerShell@5
+        displayName: Install Chaos Mesh on the AKS cluster
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            helm repo add chaos-mesh https://charts.chaos-mesh.org
+            helm repo update
+            helm upgrade --install chaos-mesh chaos-mesh/chaos-mesh --create-namespace --namespace=chaos-testing --set chaosDaemon.runtime=containerd --set chaosDaemon.socketPath=/run/containerd/containerd.sock
+
+# Not removing this rule, as interestingly the products api ceases to be available if you do; looks like the nsg-aks is incorrect?
+      # - task: AzureCLI@2
+      #   displayName: Remove the Certs NSG Rule
+      #   env:
+      #     deploymentName: ${{variables.deploymentName}}
+      #     deploymentSubscription: ${{variables.deploymentSubscription}}        
+      #   inputs:
+      #     scriptType: pscore
+      #     scriptLocation: inlineScript
+      #     azureSubscription: ${{ parameters.serviceConnection }}
+      #     addSpnToEnvironment: True
+      #     visibleAzLogin: true
+      #     inlineScript: |
+      #       if($($env:deploymentSubscription)) {
+      #         Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+      #         az account set --subscription "$($env:deploymentSubscription)"
+      #       }
+      #       $NSGAKSNAME=$env:deploymentName+"nsg-aks"
+      #       $RG_NAME=$env:deploymentName+"-rg"
+      #       az network nsg rule delete --resource-group $RG_NAME --nsg-name $NSGAKSNAME --name "AllowAll"
+
+
+  - stage: deploy_carts
+    displayName: Deploy Carts API to AKS
+    dependsOn: [deploy_infra, build_carts_api]
+    ${{ if eq(parameters.useHostedAgents, true) }}:  
+      pool:
+        vmImage: "ubuntu-latest" # Microsoft Hosted Linux Pool
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}   
+
+    jobs:
+    - job:
+      steps:
+      - checkout: self
+        path: 'checkout_self'
+        clean: True
+        fetchDepth: 0
+        persistCredentials: True                        
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the Deployment Outputs
+        inputs:
+          artifact: deployment-output  
+
+      - task: AzurePowerShell@5
+        displayName: Parse Deployment Output
+        name: depout
+        env:
+          deploymentName: ${{variables.deploymentName}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $file = Join-Path $(Agent.BuildDirectory) "output.deployment${{variables.deploymentName}}.json"
+            $deploymentOutput = Get-Content $file | ConvertFrom-Json -Depth 10  
+            $deploymentOutput.psobject.properties | ForEach-Object {
+                Write-Host "##vso[task.setvariable variable=$($_.Name.ToUpper());isoutput=true;isreadonly=true]$($_.Value.Value)"
+                Write-Host "$($_.Name.ToUpper()) = $($_.Value.Value)"
+            }          
+
+      - task: AzureCLI@2
+        displayName: Deploy Carts API to ACA
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}    
+          ACA_APPNAME: $(depout.ACA_APPNAME)
+          RG_NAME: $(depout.RG_NAME)
+          ACR_REPO_CARTS_NAME: ${{variables.cartsRepoName}}
+          ACR_NAME: $(depout.ACR_NAME)
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: false
+          inlineScript: |
+            az provider register -n Microsoft.App --wait
+            az config set extension.use_dynamic_install=yes_without_prompt
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              az account set --subscription "$($env:deploymentSubscription)"
+            }
+            Write-Host "$($env:ACR_REPO_CARTS_NAME):$(Build.SourceVersion)"
+            $image = "$($env:ACR_NAME).azurecr.io/$($env:ACR_REPO_CARTS_NAME):$(Build.SourceVersion)"
+            Write-Host "Deploying image $image"
+            az containerapp update -n $env:ACA_APPNAME -g $env:RG_NAME --image $image
+
+
+  - stage: build_website
+    displayName: Build Website
+    dependsOn: [deploy_products, deploy_carts]
+    ${{ if eq(parameters.useHostedAgents, true) }}:  
+      pool:
+        vmImage: "ubuntu-latest" # Microsoft Hosted Linux Pool
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}   
+
+    jobs:
+    - job:
+      steps:
+      - checkout: self
+        path: 'checkout_self'
+        clean: True
+        fetchDepth: 0
+        persistCredentials: True                        
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the Deployment Outputs
+        inputs:
+          artifact: deployment-output  
+
+      - task: AzurePowerShell@5
+        displayName: Parse Deployment Output
+        name: depout
+        env:
+          deploymentName: ${{variables.deploymentName}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $file = Join-Path $(Agent.BuildDirectory) "output.deployment${{variables.deploymentName}}.json"
+            $deploymentOutput = Get-Content $file | ConvertFrom-Json -Depth 10  
+            $deploymentOutput.psobject.properties | ForEach-Object {
+                Write-Host "##vso[task.setvariable variable=$($_.Name.ToUpper());isoutput=true;isreadonly=true]$($_.Value.Value)"
+                Write-Host "$($_.Name.ToUpper()) = $($_.Value.Value)"
+            }     
+
+      - task: PowerShell@2
+        displayName: Update Website Environment
+        env:
+          WEBSITE_CLIENTID: ''   
+          ENTRA_AUTHORITY: $(depout.ENTRA_AUTHORITY)   
+          FRONTDOOR_ENDPOINT: $(depout.FRONTDOOR_ENDPOINT)      
+        inputs:
+          targetType: inline
+          pwsh: True
+          script: |
+             (Get-Content ./src/app/ContosoTraders.Ui.Website/.env.production).Replace('{{ENTRA_AUTHORITY}}', "$env:ENTRA_AUTHORITY") | Set-Content ./src/app/ContosoTraders.Ui.Website/.env.production 
+             (Get-Content ./src/app/ContosoTraders.Ui.Website/.env.production).Replace('{{FRONTDOOR_ENDPOINT}}', "$env:FRONTDOOR_ENDPOINT") | Set-Content ./src/app/ContosoTraders.Ui.Website/.env.production 
+             (Get-Content ./src/app/ContosoTraders.Ui.Website/.env.production).Replace('{{WEBSITE_CLIENTID}}', "$env:WEBSITE_CLIENTID") | Set-Content ./src/app/ContosoTraders.Ui.Website/.env.production 
+
+      - task: UseNode@1
+        displayName: Setup Node
+        inputs:
+          version: 20.15.0
+
+      - task: Npm@1
+        inputs:
+          command: ci
+          workingDir: src/app/ContosoTraders.Ui.Website
+
+      - task: Npm@1
+        inputs:
+          command: custom
+          customCommand: run build
+          workingDir: src/app/ContosoTraders.Ui.Website    
+
+      - task: PublishPipelineArtifact@1
+        displayName: Publish the Website Build
+        inputs:
+          targetPath: src/app/ContosoTraders.Ui.Website/build
+          artifactName: websiteBuild                    
+
+
+  - stage: deploy_website
+    displayName: Deploy Website to Storage
+    dependsOn: [build_website]
+    ${{ if eq(parameters.useHostedAgents, true) }}:  
+      pool:
+        vmImage: "ubuntu-latest" # Microsoft Hosted Linux Pool
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}   
+
+    jobs:
+    - job:
+      steps:
+      - checkout: self
+        path: 'checkout_self'
+        clean: True
+        fetchDepth: 0
+        persistCredentials: True                        
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the Deployment Outputs
+        inputs:
+          artifact: deployment-output  
+
+      - task: AzurePowerShell@5
+        displayName: Parse Deployment Output
+        name: depout
+        env:
+          deploymentName: ${{variables.deploymentName}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $file = Join-Path $(Agent.BuildDirectory) "output.deployment${{variables.deploymentName}}.json"
+            $deploymentOutput = Get-Content $file | ConvertFrom-Json -Depth 10  
+            $deploymentOutput.psobject.properties | ForEach-Object {
+                Write-Host "##vso[task.setvariable variable=$($_.Name.ToUpper());isoutput=true;isreadonly=true]$($_.Value.Value)"
+                Write-Host "$($_.Name.ToUpper()) = $($_.Value.Value)"
+            }          
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the Website
+        inputs:
+          artifact: websiteBuild
+          path: $(Agent.BuildDirectory)/websiteBuild
+
+      - task: AzurePowerShell@5
+        displayName: Enable Static Website
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}
+          RG_NAME: $(depout.RG_NAME)
+          STORAGE_ACCOUNTNAME_UI: $(depout.STORAGE_ACCOUNTNAME_UI)
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |     
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              Set-AzContext -Subscription "$($env:deploymentSubscription)"
+            }          
+            $storageAccount = Get-AzStorageAccount -ResourceGroupName $env:RG_NAME -AccountName $env:STORAGE_ACCOUNTNAME_UI
+            Enable-AzStorageStaticWebsite -Context $storageAccount.Context -IndexDocument 'index.html' -ErrorDocument404Path 'index.html'               
+
+      - task: AzureCLI@2
+        displayName: Deploy UI to Storage
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}    
+          STORAGE_ACCOUNTNAME_UI: $(depout.STORAGE_ACCOUNTNAME_UI)
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: false
+          inlineScript: |
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              az account set --subscription "$($env:deploymentSubscription)"
+            }          
+            az storage blob sync --account-name $env:STORAGE_ACCOUNTNAME_UI -c '$web' -s '$(Agent.BuildDirectory)/websiteBuild'
+
+
+  - stage: deploy_static_images
+    displayName: Deploy Static Images to Storage
+    dependsOn: [deploy_infra]
+    ${{ if eq(parameters.useHostedAgents, true) }}:  
+      pool:
+        vmImage: "ubuntu-latest" # Microsoft Hosted Linux Pool
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}   
+
+    jobs:
+    - job:
+      steps:
+      - checkout: self
+        path: 'checkout_self'
+        clean: True
+        fetchDepth: 0
+        persistCredentials: True                        
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the Deployment Outputs
+        inputs:
+          artifact: deployment-output        
+
+      - task: AzurePowerShell@5
+        displayName: Parse Deployment Output
+        name: depout
+        env:
+          deploymentName: ${{variables.deploymentName}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $file = Join-Path $(Agent.BuildDirectory) "output.deployment${{variables.deploymentName}}.json"
+            $deploymentOutput = Get-Content $file | ConvertFrom-Json -Depth 10  
+            $deploymentOutput.psobject.properties | ForEach-Object {
+                Write-Host "##vso[task.setvariable variable=$($_.Name.ToUpper());isoutput=true;isreadonly=true]$($_.Value.Value)"
+                Write-Host "$($_.Name.ToUpper()) = $($_.Value.Value)"
+            }       
+
+      - task: AzurePowerShell@5
+        displayName: Enable Static Website
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}
+          STORAGE_ACCOUNTNAME_IMAGES: $(depout.STORAGE_ACCOUNTNAME_IMAGES)
+          RG_NAME: $(depout.RG_NAME)
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              Set-AzContext -Subscription "$($env:deploymentSubscription)"
+            }          
+            $storageAccount = Get-AzStorageAccount -ResourceGroupName $env:RG_NAME -AccountName $env:STORAGE_ACCOUNTNAME_IMAGES
+            Enable-AzStorageStaticWebsite -Context $storageAccount.Context -IndexDocument 'index.html' -ErrorDocument404Path 'index.html'                       
+
+      - task: AzureCLI@2
+        displayName: Upload Images
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}    
+          STORAGE_ACCOUNTNAME_IMAGES: $(depout.STORAGE_ACCOUNTNAME_IMAGES)
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: false
+          inlineScript: |        
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              az account set --subscription "$($env:deploymentSubscription)"
+            }      
+
+            az storage blob sync --account-name $env:STORAGE_ACCOUNTNAME_IMAGES -c '$web' -s 'src/app/ContosoTraders.Api.Images'              
+
+
+  - stage: insert_sampledata
+    displayName: Insert Sample Data in Database
+    dependsOn: [deploy_infra]
+    ${{ if eq(parameters.useHostedAgents, true) }}:  
+      pool:
+        vmImage: "ubuntu-latest" # Microsoft Hosted Linux Pool
+    ${{ else }}:
+      pool:
+        name: ${{ parameters.poolName }}   
+
+    jobs:
+    - job:
+      steps:
+      - checkout: self
+        path: 'checkout_self'
+        clean: True
+        fetchDepth: 0
+        persistCredentials: True                        
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the Deployment Outputs
+        inputs:
+          artifact: deployment-output        
+
+      - task: AzurePowerShell@5
+        displayName: Parse Deployment Output
+        name: depout
+        env:
+          deploymentName: ${{variables.deploymentName}}
+        inputs:
+          pwsh: true
+          ScriptType: InlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          azurePowerShellVersion: 'LatestVersion'
+          Inline: |
+            $file = Join-Path $(Agent.BuildDirectory) "output.deployment${{variables.deploymentName}}.json"
+            $deploymentOutput = Get-Content $file | ConvertFrom-Json -Depth 10  
+            $deploymentOutput.psobject.properties | ForEach-Object {
+                Write-Host "##vso[task.setvariable variable=$($_.Name.ToUpper());isoutput=true;isreadonly=true]$($_.Value.Value)"
+                Write-Host "$($_.Name.ToUpper()) = $($_.Value.Value)"
+            }    
+
+      - task: AzureCLI@2
+        displayName: Get SQL Database Access and load data
+        env:
+          deploymentSubscription: ${{variables.deploymentSubscription}}    
+          RG_NAME: $(depout.RG_NAME)
+          SQL_SERVERNAME: $(depout.SQL_SERVERNAME)
+          SQL_PRODUCTSDATABASENAME: $(depout.SQL_PRODUCTSDATABASENAME)
+        inputs:
+          scriptType: pscore
+          scriptLocation: inlineScript
+          azureSubscription: ${{ parameters.serviceConnection }}
+          addSpnToEnvironment: True
+          visibleAzLogin: false
+          inlineScript: |        
+            if($($env:deploymentSubscription)) {
+              Write-Host "Setting target subscription to $($env:deploymentSubscription)"
+              az account set --subscription "$($env:deploymentSubscription)"
+            }                              
+            $userObjectId = $env:servicePrincipalId
+            az sql server ad-admin create --display-name 'github-sp' --object-id $userObjectId --resource-group $env:RG_NAME --server $env:SQL_SERVERNAME
+
+            $connectionStringProducts = ("Server=tcp:{0}.database.windows.net,1433;Initial Catalog={1};Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;Authentication='Active Directory Default';" -f $env:SQL_SERVERNAME, $env:SQL_PRODUCTSDATABASENAME)
+            Write-Host "##vso[task.setvariable variable=SQL_CONNECTION_STRING_PRODUCTS;isoutput=true;isreadonly=true]$connectionStringProducts"
+
+            if (-not (Get-Module -ListAvailable -Name SqlServer)) {
+              Install-Module -Name SqlServer -Force -AllowClobber
+            }
+            Invoke-Sqlcmd -InputFile ./src/app/ContosoTraders.Api.Products/Migration/productsdb.sql -ConnectionString $connectionStringProducts
